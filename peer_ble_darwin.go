@@ -6,17 +6,53 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/tinygo-org/cbgo"
 	"tinygo.org/x/bluetooth"
 )
 
 var adapter = bluetooth.DefaultAdapter
 
+// darwinAdvState holds a dedicated PeripheralManager for advertising on macOS
+// (tinygo bluetooth does not expose DefaultAdvertisement on darwin).
+var darwinAdvState struct {
+	pm         cbgo.PeripheralManager
+	pmOnce     sync.Once
+	poweredCh  chan struct{}
+	poweredSet int32
+}
+
+type darwinAdvDelegate struct {
+	cbgo.PeripheralManagerDelegateBase
+}
+
+func (d *darwinAdvDelegate) PeripheralManagerDidUpdateState(pmgr cbgo.PeripheralManager) {
+	if pmgr.State() == cbgo.ManagerStatePoweredOn && atomic.CompareAndSwapInt32(&darwinAdvState.poweredSet, 0, 1) {
+		close(darwinAdvState.poweredCh)
+	}
+}
+
+func (d *darwinAdvDelegate) DidStartAdvertising(pmgr cbgo.PeripheralManager, err error) {
+	// Optional: could surface err to caller
+	_ = err
+}
+
 func bytesToUUID(b []byte) bluetooth.UUID {
 	var arr [16]byte
 	copy(arr[:], b)
 	return bluetooth.NewUUID(arr)
+}
+
+// serviceUUIDForCBGO returns the BlueTalk service UUID in cbgo format for advertisement.
+func serviceUUIDForCBGO() cbgo.UUID {
+	s := bytesToUUID(serviceUUID).String()
+	u, err := cbgo.ParseUUID(s)
+	if err != nil {
+		panic("blueTalk service UUID: " + err.Error())
+	}
+	return u
 }
 
 func (p *Peer) setupPlatform() error {
@@ -27,13 +63,32 @@ func (p *Peer) setupPlatform() error {
 	return nil
 }
 
-// startAdvertising is a no-op on macOS (peripheral advertising not supported by tinygo bluetooth).
 func (p *Peer) startAdvertising() error {
+	darwinAdvState.pmOnce.Do(func() {
+		darwinAdvState.poweredCh = make(chan struct{})
+		darwinAdvState.pm = cbgo.NewPeripheralManager(nil)
+		darwinAdvState.pm.SetDelegate(&darwinAdvDelegate{})
+	})
+
+	// Wait for peripheral manager to be powered on (same radio as central).
+	select {
+	case <-darwinAdvState.poweredCh:
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("BLE peripheral manager did not become ready in time")
+	}
+
+	darwinAdvState.pm.StartAdvertising(cbgo.AdvData{
+		LocalName:     serviceName,
+		ServiceUUIDs:  []cbgo.UUID{serviceUUIDForCBGO()},
+	})
 	return nil
 }
 
-// stopAdvertising is a no-op on macOS.
 func (p *Peer) stopAdvertising() error {
+	if atomic.LoadInt32(&darwinAdvState.poweredSet) != 1 {
+		return nil // never started advertising
+	}
+	darwinAdvState.pm.StopAdvertising()
 	return nil
 }
 
@@ -180,9 +235,13 @@ func (p *Peer) runDiscoveryAndConnection() {
 			continue
 		}
 
-		// macOS does not support BLE peripheral advertising; just wait and rescan.
-		p.publishStatus("No peers found. Will rescan in 5s (macOS cannot advertise).")
-		time.Sleep(5 * time.Second)
+		p.publishStatus("No peers found. Advertising...")
+		if err := p.startAdvertising(); err != nil {
+			p.publishStatus(fmt.Sprintf("Advertising failed: %v", err))
+		} else {
+			time.Sleep(5 * time.Second)
+			_ = p.stopAdvertising()
+		}
 	}
 }
 
