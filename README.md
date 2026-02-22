@@ -1,28 +1,22 @@
 # bluetalk
 
-Bluetooth-only chat CLI. No server, no database. One host (BLE Peripheral) and one or more clients (BLE Central) over BLE.
+Bluetooth-only chat CLI with automatic peer mode. No server, no database.
 
 ## Platform support
 
-- **Host (H)** must run on **Linux or Windows**. TinyGo BLE on macOS supports Central only; Host mode is not available on macOS.
-- **Client (C)** works on **macOS, Linux, and Windows**.
+- **Linux / Windows**: full auto role selection (alternates advertise + scan until connected).
+- **macOS**: Central-only with TinyGo BLE. The app auto-scans/connects, but cannot advertise.
+- **macOS <-> macOS**: not supported with current backend because neither side can advertise.
 
 ## Usage
 
-1. On a Linux or Windows machine, run as Host:
-   ```bash
-   go run .
-   # Choose: H
-   ```
+On both devices, just run:
 
-2. On any supported machine (including macOS), run as Client:
-   ```bash
-   go run .
-   # Choose: C
-   ```
+```bash
+go run .
+```
 
-3. Type messages and press Enter. Host messages are prefixed with "Host: "; client messages appear as "[Client]: ..." on the host and in the notification callback on clients.
-4. Client scan has a 25-second timeout and prints a hint if no host is advertising.
+The app automatically performs discovery and connects when a peer is found. After connection, type messages and press Enter.
 
 ## Build
 

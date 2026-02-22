@@ -224,7 +224,7 @@ func (m *BLEManager) sendLoop() {
 			}
 
 			// Send with windowing/throttling
-			for i := 0; i < len(frags); i++ {
+			for i := range frags {
 				m.SendRaw(frags[i])
 
 				// 4-fragment window throttling
