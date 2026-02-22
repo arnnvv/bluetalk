@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -68,9 +67,7 @@ func (p *Peer) Run() {
 
 	go p.writeLoop()
 
-	if err := p.discoveryLoop(); err != nil {
-		p.publishStatus(fmt.Sprintf("Discovery loop stopped: %v", err))
-	}
+	p.runDiscoveryAndConnection()
 }
 
 func (p *Peer) writeLoop() {
@@ -147,12 +144,8 @@ func (p *Peer) writeRaw(data []byte) error {
 		}
 		return err
 	}
-	return p.writePeripheral(data)
-}
-
-// connectAndSubscribe is implemented by the platform (Linux BlueZ or Darwin stub).
-func (p *Peer) connectAndSubscribe(addr string) error {
-	return p.connectAndSubscribePlatform(context.Background(), addr)
+	_, err := p.writePeripheral(data)
+	return err
 }
 
 func (p *Peer) publishStatus(msg string) {
