@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/godbus/dbus/v5"
+	"bluetalk/dbus"
 )
 
 const (

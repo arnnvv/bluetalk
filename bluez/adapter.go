@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/godbus/dbus/v5"
+	"bluetalk/dbus"
 )
 
 // Adapter wraps the BlueZ adapter (e.g. /org/bluez/hci0).

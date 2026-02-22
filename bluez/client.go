@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/godbus/dbus/v5"
+	"bluetalk/dbus"
 )
 
 // CentralClient represents a BLE central connection (device + RX char for write, TX for notify).
@@ -71,7 +71,7 @@ func Connect(ctx context.Context, conn *dbus.Conn, adapterPath dbus.ObjectPath, 
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		if resolved, ok := v.Value().(bool); ok && resolved {
+		if resolved, ok := v.Value.(bool); ok && resolved {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -99,7 +99,7 @@ func Connect(ctx context.Context, conn *dbus.Conn, adapterPath dbus.ObjectPath, 
 		if !ok {
 			continue
 		}
-		u, _ := g["UUID"].Value().(string)
+		u, _ := g["UUID"].Value.(string)
 		if u == svcStr {
 			servicePath = path
 			break
@@ -121,7 +121,7 @@ func Connect(ctx context.Context, conn *dbus.Conn, adapterPath dbus.ObjectPath, 
 		if !ok {
 			continue
 		}
-		u, _ := g["UUID"].Value().(string)
+		u, _ := g["UUID"].Value.(string)
 		if u == rxStr {
 			writeCharPath = path
 		}
@@ -149,8 +149,7 @@ func Connect(ctx context.Context, conn *dbus.Conn, adapterPath dbus.ObjectPath, 
 		return nil, fmt.Errorf("StartNotify: %w", err)
 	}
 
-	ch := make(chan *dbus.Signal, 16)
-	conn.Signal(ch)
+	ch := conn.Signal()
 	matchNotify := fmt.Sprintf("type='signal',path='%s',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'", notifyCharPath)
 	conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchNotify)
 	matchDev := fmt.Sprintf("type='signal',path='%s',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'", devicePath)
@@ -165,8 +164,8 @@ func Connect(ctx context.Context, conn *dbus.Conn, adapterPath dbus.ObjectPath, 
 				continue
 			}
 			if sig.Path == notifyCharPath {
-				if v, ok := changed["Value"]; ok {
-					if b, ok := v.Value().([]byte); ok && len(b) > 0 {
+				if v, ok := changed["Value"]; ok && v.Value != nil {
+					if b, ok := v.Value.([]byte); ok && len(b) > 0 {
 						pkt := make([]byte, len(b))
 						copy(pkt, b)
 						onNotify(pkt)

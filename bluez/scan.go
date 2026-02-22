@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/godbus/dbus/v5"
+	"bluetalk/dbus"
 )
 
 // ScanResult holds a discovered device's address, name, and service UUIDs.
@@ -31,8 +31,7 @@ func Scan(ctx context.Context, conn *dbus.Conn, adapter *Adapter, serviceUUIDStr
 	// InterfacesAdded is emitted by org.bluez; body is (object_path, interfaces).
 	match := "type='signal',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'"
 	conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, match)
-	ch := make(chan *dbus.Signal, 8)
-	conn.Signal(ch)
+	ch := conn.Signal()
 
 	for {
 		select {
@@ -45,12 +44,11 @@ func Scan(ctx context.Context, conn *dbus.Conn, adapter *Adapter, serviceUUIDStr
 			if len(sig.Body) < 2 {
 				continue
 			}
-			path, ok := sig.Body[0].(dbus.ObjectPath)
+			path, ok := sig.Body[0].(string)
 			if !ok {
 				continue
 			}
-			// Only consider devices under our adapter.
-			if !strings.HasPrefix(string(path), string(adapter.Path())+"/") {
+			if !strings.HasPrefix(path, string(adapter.Path())+"/") {
 				continue
 			}
 			ifaces, ok := sig.Body[1].(map[string]map[string]dbus.Variant)
@@ -61,22 +59,22 @@ func Scan(ctx context.Context, conn *dbus.Conn, adapter *Adapter, serviceUUIDStr
 			if !ok {
 				continue
 			}
-			addr := AddrFromPath(path)
+			addr := AddrFromPath(dbus.ObjectPath(path))
 			if addr == "" {
 				continue
 			}
 			name := ""
 			if n, ok := dev["Alias"]; ok {
-				name, _ = n.Value().(string)
+				name, _ = n.Value.(string)
 			}
 			if name == "" {
 				if n, ok := dev["Name"]; ok {
-					name, _ = n.Value().(string)
+					name, _ = n.Value.(string)
 				}
 			}
 			var uuids []string
 			if u, ok := dev["UUIDs"]; ok {
-				uuids, _ = u.Value().([]string)
+				uuids, _ = u.Value.([]string)
 			}
 			matchName := nameFilter == "" || name == nameFilter
 			matchUUID := serviceUUIDStr == "" || slices.Contains(uuids, serviceUUIDStr)

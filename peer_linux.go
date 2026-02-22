@@ -7,9 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/godbus/dbus/v5"
-
 	"bluetalk/bluez"
+	"bluetalk/dbus"
 )
 
 var (
