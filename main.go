@@ -3,218 +3,134 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
+	"time"
 
-	"golang.org/x/sys/unix"
+	"tinygo.org/x/bluetooth"
 )
 
-// RC_CHANNEL is the RFCOMM channel (1-30). Must be same on all devices.
-const RC_CHANNEL = 4
-
-// A thread-safe map to store connected clients (for the Host)
 var (
-	clients   = make(map[int]string) // Key: File Descriptor, Value: Name
-	clientsMu sync.Mutex
+	chatServiceUUID = bluetooth.NewUUID([16]byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef})
+	chatCharUUID    = bluetooth.NewUUID([16]byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xee})
 )
 
 func main() {
-	fmt.Println("--- Bluetooth Chat (RFCOMM) ---")
-	fmt.Print("Run as (H)ost or (C)lient? ")
+	fmt.Println("--- Bluetooth Chat CLI ---")
+	fmt.Print("Choose mode Host (H) or Client (C): ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return
+	}
 
-	reader := bufio.NewReader(os.Stdin)
-	mode, _ := reader.ReadString('\n')
-	mode = strings.TrimSpace(strings.ToUpper(mode))
-
-	if mode == "H" {
-		runHost()
-	} else if mode == "C" {
-		fmt.Print("Enter Host MAC Address (XX:XX:XX:XX:XX:XX): ")
-		mac, _ := reader.ReadString('\n')
-		mac = strings.TrimSpace(mac)
-		runClient(mac)
-	} else {
-		fmt.Println("Invalid mode.")
+	switch strings.ToUpper(strings.TrimSpace(scanner.Text())) {
+	case "H":
+		if err := runHost(); err != nil {
+			fmt.Println("Host error:", err)
+		}
+	case "C":
+		if err := runClient(); err != nil {
+			fmt.Println("Client error:", err)
+		}
+	default:
+		fmt.Println("Invalid mode. Use H (Host) or C (Client).")
 	}
 }
 
-func runHost() {
-	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_STREAM, unix.BTPROTO_RFCOMM)
+func runClient() error {
+	adapter := bluetooth.DefaultAdapter
+	if err := adapter.Enable(); err != nil {
+		return err
+	}
+
+	fmt.Println("Starting Client mode...")
+	fmt.Println("Scanning for ChatHost...")
+
+	var target bluetooth.ScanResult
+	var found atomic.Bool
+	var timedOut atomic.Bool
+
+	scanDone := make(chan error, 1)
+	go func() {
+		scanDone <- adapter.Scan(func(a *bluetooth.Adapter, result bluetooth.ScanResult) {
+			if found.Load() {
+				return
+			}
+			if result.LocalName() == "ChatHost" || result.HasServiceUUID(chatServiceUUID) {
+				target = result
+				found.Store(true)
+				_ = a.StopScan()
+			}
+		})
+	}()
+
+	timeout := time.AfterFunc(25*time.Second, func() {
+		if !found.Load() {
+			timedOut.Store(true)
+			_ = adapter.StopScan()
+		}
+	})
+	scanErr := <-scanDone
+	timeout.Stop()
+
+	if scanErr != nil && !found.Load() {
+		return scanErr
+	}
+	if !found.Load() {
+		if timedOut.Load() {
+			fmt.Println("Host not found. Is the host running and advertising?")
+			return nil
+		}
+		return fmt.Errorf("scan ended before finding host")
+	}
+
+	fmt.Printf("Found host: %s\n", target.Address.String())
+	device, err := adapter.Connect(target.Address, bluetooth.ConnectionParams{})
 	if err != nil {
-		log.Fatalf("Socket creation failed: %v", err)
+		return err
 	}
-	defer unix.Close(fd)
+	defer device.Disconnect()
 
-	addr := &unix.SockaddrRFCOMM{Channel: RC_CHANNEL}
-	// Address [0,0,0,0,0,0] means "Any Local Adapter"
-	copy(addr.Addr[:], []byte{0, 0, 0, 0, 0, 0})
-
-	if err := unix.Bind(fd, addr); err != nil {
-		log.Fatalf("Bind failed: %v", err)
+	services, err := device.DiscoverServices([]bluetooth.UUID{chatServiceUUID})
+	if err != nil {
+		return err
 	}
-
-	// Listen for connections
-	if err := unix.Listen(fd, 1); err != nil {
-		log.Fatalf("Listen failed: %v", err)
+	if len(services) == 0 {
+		return fmt.Errorf("chat service not found")
 	}
 
-	fmt.Printf("Hosting on Channel %d. Waiting for friends...\n", RC_CHANNEL)
+	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{chatCharUUID})
+	if err != nil {
+		return err
+	}
+	if len(chars) == 0 {
+		return fmt.Errorf("chat characteristic not found")
+	}
+	char := chars[0]
 
-	// Start a goroutine to read Host's typing and broadcast it
-	go hostInputHandler()
+	if err := char.EnableNotifications(func(value []byte) {
+		msg := make([]byte, len(value))
+		copy(msg, value)
+		fmt.Printf("\n%s\nYou: ", string(msg))
+	}); err != nil {
+		return err
+	}
 
+	fmt.Println("Connected. Type messages and press Enter.")
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		// Accept new connection
-		nfd, sa, err := unix.Accept(fd)
-		if err != nil {
-			log.Println("Accept error:", err)
+		fmt.Print("You: ")
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
+
+		text := strings.TrimSpace(scanner.Text())
+		if text == "" {
 			continue
 		}
-
-		// Convert raw sockaddr to a readable string (rudimentary)
-		// Go's unix package doesn't make converting MACs easy, so we just use an ID.
-		clientID := nfd
-		clientAddr := sa.(*unix.SockaddrRFCOMM).Addr
-		macStr := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-			clientAddr[5], clientAddr[4], clientAddr[3], clientAddr[2], clientAddr[1], clientAddr[0])
-
-		fmt.Printf("\n[+] Connected: %s\n", macStr)
-
-		clientsMu.Lock()
-		clients[clientID] = macStr
-		clientsMu.Unlock()
-
-		// Handle this client in a new Goroutine
-		go handleConnection(nfd, macStr)
-	}
-}
-
-func handleConnection(fd int, name string) {
-	defer func() {
-		unix.Close(fd)
-		clientsMu.Lock()
-		delete(clients, fd)
-		clientsMu.Unlock()
-		fmt.Printf("\n[-] Disconnected: %s\n", name)
-	}()
-
-	buf := make([]byte, 1024)
-	for {
-		n, err := unix.Read(fd, buf)
-		if err != nil || n == 0 {
-			return
-		}
-		msg := string(buf[:n])
-		fmt.Printf("\n[%s]: %s\nYou: ", name, msg)
-
-		// Broadcast to others
-		broadcast(msg, fd, name)
-	}
-}
-
-func broadcast(msg string, senderFD int, senderName string) {
-	clientsMu.Lock()
-	defer clientsMu.Unlock()
-
-	formattedMsg := fmt.Sprintf("[%s]: %s", senderName, msg)
-
-	for fd := range clients {
-		if fd != senderFD {
-			unix.Write(fd, []byte(formattedMsg))
+		if _, err := char.WriteWithoutResponse([]byte(text)); err != nil {
+			return err
 		}
 	}
-}
-
-func hostInputHandler() {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print("You: ")
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-
-		// Broadcast host message to all clients
-		clientsMu.Lock()
-		for fd := range clients {
-			unix.Write(fd, []byte("Host: "+text))
-		}
-		clientsMu.Unlock()
-	}
-}
-
-// --- CLIENT LOGIC ---
-
-func runClient(mac string) {
-	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_STREAM, unix.BTPROTO_RFCOMM)
-	if err != nil {
-		log.Fatalf("Socket error: %v", err)
-	}
-	defer unix.Close(fd)
-
-	// Parse MAC String to Byte Array
-	addrBytes, err := parseMAC(mac)
-	if err != nil {
-		log.Fatalf("Invalid MAC: %v", err)
-	}
-
-	// Connect
-	rsa := &unix.SockaddrRFCOMM{Channel: RC_CHANNEL}
-	copy(rsa.Addr[:], addrBytes)
-
-	fmt.Printf("Connecting to %s...\n", mac)
-	if err := unix.Connect(fd, rsa); err != nil {
-		log.Fatalf("Connection failed. Are you paired? Error: %v", err)
-	}
-	fmt.Println("Connected! Start typing.")
-
-	// Goroutine to listen for incoming messages
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := unix.Read(fd, buf)
-			if err != nil {
-				fmt.Println("\nServer disconnected.")
-				os.Exit(0)
-			}
-			fmt.Printf("\n%s\nYou: ", string(buf[:n]))
-		}
-	}()
-
-	// Main loop to send messages
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print("You: ")
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-		_, err := unix.Write(fd, []byte(text))
-		if err != nil {
-			break
-		}
-	}
-}
-
-// Helper: Convert "AA:BB:CC:11:22:33" -> [6]byte (reversed for Little Endian)
-func parseMAC(s string) ([]byte, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) != 6 {
-		return nil, fmt.Errorf("invalid format")
-	}
-	var addr [6]byte
-	// Bluetooth addresses are often stored in Little Endian in C structs,
-	// so we reverse the order: input[0] goes to addr[5]
-	for i := 0; i < 6; i++ {
-		val, err := hexToByte(parts[i])
-		if err != nil {
-			return nil, err
-		}
-		addr[5-i] = val
-	}
-	return addr[:], nil
-}
-
-func hexToByte(s string) (byte, error) {
-	var b byte
-	_, err := fmt.Sscanf(s, "%x", &b)
-	return b, err
 }
