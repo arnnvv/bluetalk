@@ -27,12 +27,10 @@ func EncodeMessage(msgID uint32, data []byte) [][]byte {
 	}
 	total := uint16((len(data) + MaxPayloadLen - 1) / MaxPayloadLen)
 	var frags [][]byte
-	for i := uint16(0); i < total; i++ {
+	for i := range total {
 		start := int(i) * MaxPayloadLen
 		end := start + MaxPayloadLen
-		if end > len(data) {
-			end = len(data)
-		}
+		end = min(end, len(data))
 		chunk := data[start:end]
 		buf := make([]byte, HeaderSize+len(chunk))
 		binary.BigEndian.PutUint32(buf[0:4], msgID)
