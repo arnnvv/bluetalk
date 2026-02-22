@@ -1,12 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"tinygo.org/x/bluetooth"
 )
 
 const (
@@ -14,32 +13,45 @@ const (
 	bleMTU      = 20
 )
 
+// 128-bit custom UUIDs for BlueTalk (raw bytes for platform use).
 var (
-	serviceUUID = bluetooth.NewUUID([16]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55})
-	rxUUID      = bluetooth.NewUUID([16]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x66})
-	txUUID      = bluetooth.NewUUID([16]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x77})
+	serviceUUID = []byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55}
+	rxUUID      = []byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x66}
+	txUUID      = []byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x77}
 )
 
-type Peer struct {
-	adapter *bluetooth.Adapter
+// centralConn is the interface for an active BLE central connection (write + disconnect).
+type centralConn interface {
+	WriteNoResponse(data []byte) error
+	Close() error
+	Disconnected() <-chan struct{}
+}
 
+// peripheralNotifier is the interface for sending notifications as a BLE peripheral.
+type peripheralNotifier interface {
+	Write(data []byte) (int, error)
+	Close() error
+}
+
+type Peer struct {
 	sendCh   chan string
 	recvCh   chan string
 	statusCh chan string
 
-	mu           sync.Mutex
-	connected    atomic.Bool
-	isCentral    bool
-	centralDev   *bluetooth.Device
-	centralRX    bluetooth.DeviceCharacteristic
-	peripheralTX bluetooth.Characteristic
+	mu        sync.Mutex
+	connected atomic.Bool
+	isCentral bool
+
+	centralClient centralConn
+
+	peripheralNotifierMu sync.Mutex
+	peripheralNotifier   peripheralNotifier
 
 	transport *Transport
 }
 
 func NewPeer(send, recv, status chan string) *Peer {
 	p := &Peer{
-		adapter:  bluetooth.DefaultAdapter,
 		sendCh:   send,
 		recvCh:   recv,
 		statusCh: status,
@@ -49,11 +61,6 @@ func NewPeer(send, recv, status chan string) *Peer {
 }
 
 func (p *Peer) Run() {
-	if err := p.adapter.Enable(); err != nil {
-		p.publishStatus(fmt.Sprintf("BLE init failed: %v", err))
-		return
-	}
-
 	if err := p.setupPlatform(); err != nil {
 		p.publishStatus(fmt.Sprintf("BLE setup failed: %v", err))
 		return
@@ -78,12 +85,11 @@ func (p *Peer) writeLoop() {
 	}
 }
 
-func (p *Peer) setConnectedAsCentral(device bluetooth.Device, writeChar bluetooth.DeviceCharacteristic) {
+func (p *Peer) setConnectedAsCentral(client centralConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.centralDev = &device
-	p.centralRX = writeChar
+	p.centralClient = client
 	p.isCentral = true
 	p.connected.Store(true)
 	p.transport.OnConnected()
@@ -93,7 +99,7 @@ func (p *Peer) setConnectedAsPeripheral() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.centralDev = nil
+	p.centralClient = nil
 	p.isCentral = false
 	p.connected.Store(true)
 	p.transport.OnConnected()
@@ -106,13 +112,20 @@ func (p *Peer) handleDisconnect(reason string) {
 	}
 
 	p.mu.Lock()
-	dev := p.centralDev
-	p.centralDev = nil
+	client := p.centralClient
+	p.centralClient = nil
 	p.isCentral = false
+
+	p.peripheralNotifierMu.Lock()
+	if p.peripheralNotifier != nil {
+		_ = p.peripheralNotifier.Close()
+		p.peripheralNotifier = nil
+	}
+	p.peripheralNotifierMu.Unlock()
 	p.mu.Unlock()
 
-	if dev != nil {
-		_ = dev.Disconnect()
+	if client != nil {
+		_ = client.Close()
 	}
 
 	p.transport.OnDisconnected()
@@ -128,67 +141,18 @@ func (p *Peer) writeRaw(data []byte) error {
 	}
 
 	if p.isCentral {
-		_, err := p.centralRX.WriteWithoutResponse(data)
+		err := p.centralClient.WriteNoResponse(data)
 		if err != nil {
 			go p.handleDisconnect("Disconnected: write failed")
 		}
 		return err
 	}
-	return p.writePeripheral()
+	return p.writePeripheral(data)
 }
 
-func (p *Peer) connectAndSubscribe(addr bluetooth.Address) error {
-	device, err := p.adapter.Connect(addr, bluetooth.ConnectionParams{})
-	if err != nil {
-		return err
-	}
-
-	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
-	if err != nil || len(services) == 0 {
-		_ = device.Disconnect()
-		if err == nil {
-			err = fmt.Errorf("service not found")
-		}
-		return err
-	}
-
-	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{rxUUID, txUUID})
-	if err != nil {
-		_ = device.Disconnect()
-		return err
-	}
-
-	var remoteRX bluetooth.DeviceCharacteristic
-	var remoteTX bluetooth.DeviceCharacteristic
-	var foundRX bool
-	var foundTX bool
-	for _, c := range chars {
-		if c.UUID() == rxUUID {
-			remoteRX = c
-			foundRX = true
-		}
-		if c.UUID() == txUUID {
-			remoteTX = c
-			foundTX = true
-		}
-	}
-	if !foundRX || !foundTX {
-		_ = device.Disconnect()
-		return fmt.Errorf("required characteristic missing")
-	}
-
-	if err := remoteTX.EnableNotifications(func(value []byte) {
-		pkt := make([]byte, len(value))
-		copy(pkt, value)
-		p.transport.OnReceivePacket(pkt)
-	}); err != nil {
-		_ = device.Disconnect()
-		return err
-	}
-
-	p.setConnectedAsCentral(device, remoteRX)
-	p.publishStatus(fmt.Sprintf("Connected as Central to %s", addr.String()))
-	return nil
+// connectAndSubscribe is implemented by the platform (Linux BlueZ or Darwin stub).
+func (p *Peer) connectAndSubscribe(addr string) error {
+	return p.connectAndSubscribePlatform(context.Background(), addr)
 }
 
 func (p *Peer) publishStatus(msg string) {
