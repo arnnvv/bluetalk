@@ -5,54 +5,40 @@ import (
 	"fmt"
 	"os"
 	"strings"
-
-	"tinygo.org/x/bluetooth"
-)
-
-var (
-	chatServiceUUID = bluetooth.NewUUID([16]byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef})
-	chatCharUUID    = bluetooth.NewUUID([16]byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xee})
 )
 
 func main() {
-	fmt.Println("--- Bluetooth Chat CLI (Auto Peer Mode) ---")
-	if err := runPeer(); err != nil {
-		fmt.Println("Peer error:", err)
-	}
-}
+	fmt.Println("--- BlueTalk: Robust P2P Chat ---")
+	fmt.Println("State: Initializing BLE stack...")
 
-type peerSession struct {
-	role           string
-	centralChar    *bluetooth.DeviceCharacteristic
-	centralDevice  *bluetooth.Device
-	peripheralChar *bluetooth.Characteristic
-}
+	sendChan := make(chan string, 32)
+	recvChan := make(chan string, 32)
+	statusChan := make(chan string, 32)
 
-func (p *peerSession) Send(data []byte) error {
-	return sendPeerData(p, data)
-}
+	peer := NewPeer(sendChan, recvChan, statusChan)
+	go peer.Run()
 
-func (p *peerSession) Close() {
-	if p.centralDevice != nil {
-		_ = p.centralDevice.Disconnect()
-	}
-}
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for {
+			fmt.Print("You: ")
+			if !scanner.Scan() {
+				return
+			}
+			text := strings.TrimSpace(scanner.Text())
+			if text == "" {
+				continue
+			}
+			sendChan <- text
+		}
+	}()
 
-func chatLoop(session *peerSession) error {
-	fmt.Printf("Connected (role: %s). Type messages and press Enter.\n", session.role)
-	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("You: ")
-		if !scanner.Scan() {
-			return scanner.Err()
-		}
-
-		text := strings.TrimSpace(scanner.Text())
-		if text == "" {
-			continue
-		}
-		if err := session.Send([]byte(text)); err != nil {
-			return err
+		select {
+		case msg := <-recvChan:
+			fmt.Printf("\r\033[K[Peer]: %s\n", msg)
+		case status := <-statusChan:
+			fmt.Printf("\r\033[K[System]: %s\n", status)
 		}
 	}
 }

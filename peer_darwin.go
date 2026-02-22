@@ -9,112 +9,75 @@ import (
 	"tinygo.org/x/bluetooth"
 )
 
-func sendPeerData(p *peerSession, data []byte) error {
-	if p.centralChar == nil {
-		return fmt.Errorf("no active central chat channel")
-	}
-	_, err := p.centralChar.WriteWithoutResponse(data)
-	return err
+func (p *Peer) setupPlatform() error {
+	p.adapter.SetConnectHandler(func(device bluetooth.Device, connected bool) {
+		if !connected {
+			p.handleDisconnect(fmt.Sprintf("Disconnected from %s", device.Address.String()))
+		}
+	})
+	p.publishStatus("macOS detected: Central-only mode (no advertising)")
+	return nil
 }
 
-func runPeer() error {
-	adapter := bluetooth.DefaultAdapter
-	if err := adapter.Enable(); err != nil {
-		return err
-	}
-
-	fmt.Println("macOS: TinyGo BLE is Central-only. Running scan/connect peer mode.")
-	fmt.Println("Note: macOS-to-macOS will not connect with this backend because neither side can advertise.")
-
+func (p *Peer) discoveryLoop() error {
 	for {
-		result, found, err := scanForPeerDarwin(adapter, 3*time.Second)
+		if p.connected.Load() {
+			p.waitUntilDisconnected()
+			continue
+		}
+
+		p.publishStatus("Discovery: scanning (macOS central-only)")
+		res, found, err := p.scanForPeerDarwin(randomPhaseDuration(900, 1700))
 		if err != nil {
-			fmt.Printf("Scan error: %v\n", err)
-			time.Sleep(500 * time.Millisecond)
+			p.publishStatus(fmt.Sprintf("Scan error: %v", err))
 			continue
 		}
 		if !found {
-			fmt.Println("No peer found yet, rescanning...")
 			continue
 		}
 
-		fmt.Printf("Peer found: %s\n", result.Address.String())
-		device, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
-		if err != nil {
-			fmt.Printf("Connect failed: %v\n", err)
-			continue
+		p.publishStatus(fmt.Sprintf("Peer found: %s", res.Address.String()))
+		if err := p.connectAndSubscribe(res.Address); err != nil {
+			p.publishStatus(fmt.Sprintf("Connect failed: %v", err))
+			time.Sleep(300 * time.Millisecond)
 		}
-
-		remoteChar, err := discoverChatCharacteristicDarwin(device)
-		if err != nil {
-			_ = device.Disconnect()
-			fmt.Printf("Discovery failed: %v\n", err)
-			continue
-		}
-
-		if err := remoteChar.EnableNotifications(func(value []byte) {
-			msg := make([]byte, len(value))
-			copy(msg, value)
-			fmt.Printf("\n[Peer]: %s\nYou: ", string(msg))
-		}); err != nil {
-			_ = device.Disconnect()
-			fmt.Printf("Notification setup failed: %v\n", err)
-			continue
-		}
-
-		session := &peerSession{role: "Central", centralChar: &remoteChar, centralDevice: &device}
-		defer session.Close()
-		return chatLoop(session)
 	}
 }
 
-func scanForPeerDarwin(adapter *bluetooth.Adapter, d time.Duration) (bluetooth.ScanResult, bool, error) {
+func (p *Peer) scanForPeerDarwin(window time.Duration) (bluetooth.ScanResult, bool, error) {
 	foundCh := make(chan bluetooth.ScanResult, 1)
 	scanDone := make(chan error, 1)
 
 	go func() {
-		scanDone <- adapter.Scan(func(a *bluetooth.Adapter, result bluetooth.ScanResult) {
-			if result.LocalName() != "ChatPeer" && !result.HasServiceUUID(chatServiceUUID) {
+		scanDone <- p.adapter.Scan(func(a *bluetooth.Adapter, res bluetooth.ScanResult) {
+			if res.LocalName() != serviceName && !res.HasServiceUUID(serviceUUID) {
 				return
 			}
 			select {
-			case foundCh <- result:
+			case foundCh <- res:
 			default:
 			}
 			_ = a.StopScan()
 		})
 	}()
 
-	timer := time.AfterFunc(d, func() {
-		_ = adapter.StopScan()
+	timer := time.AfterFunc(window, func() {
+		_ = p.adapter.StopScan()
 	})
-	scanErr := <-scanDone
+	err := <-scanDone
 	timer.Stop()
 
 	select {
-	case result := <-foundCh:
-		return result, true, nil
+	case res := <-foundCh:
+		return res, true, nil
 	default:
-		return bluetooth.ScanResult{}, false, scanErr
+		if err != nil {
+			return bluetooth.ScanResult{}, false, err
+		}
+		return bluetooth.ScanResult{}, false, nil
 	}
 }
 
-func discoverChatCharacteristicDarwin(device bluetooth.Device) (bluetooth.DeviceCharacteristic, error) {
-	services, err := device.DiscoverServices([]bluetooth.UUID{chatServiceUUID})
-	if err != nil {
-		return bluetooth.DeviceCharacteristic{}, err
-	}
-	if len(services) == 0 {
-		return bluetooth.DeviceCharacteristic{}, fmt.Errorf("chat service not found")
-	}
-
-	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{chatCharUUID})
-	if err != nil {
-		return bluetooth.DeviceCharacteristic{}, err
-	}
-	if len(chars) == 0 {
-		return bluetooth.DeviceCharacteristic{}, fmt.Errorf("chat characteristic not found")
-	}
-
-	return chars[0], nil
+func (p *Peer) writePeripheral() error {
+	return fmt.Errorf("peripheral mode unavailable on macOS")
 }
